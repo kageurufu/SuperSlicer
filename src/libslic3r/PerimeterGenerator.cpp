@@ -253,7 +253,7 @@ ProcessSurfaceResult PerimeterGenerator::process_arachne(int& loop_number, const
             }
         }
 
-        auto& best_path = all_extrusions[best_candidate];
+        Arachne::ExtrusionLine* best_path = all_extrusions[best_candidate];
         ordered_extrusions.push_back({ best_path, best_path->is_contour(), false });
         processed[best_candidate] = true;
         for (size_t unlocked_idx : blocking[best_candidate])
@@ -801,6 +801,9 @@ ProcessSurfaceResult PerimeterGenerator::process_classic(int& loop_number, const
             if (unmillable.empty())
                 last = offset_ex(last, mill_extra_size);
             else {
+                //FIXME only work if mill_extra_size < mill_nozzle/2 (becasue it's the extra offset from unmillable)
+                //FIXME overhangs if mill_extra_size is too big
+                //FIXME merge with process_arachne?
                 ExPolygons growth = diff_ex(offset_ex(last, mill_extra_size), unmillable, ApplySafetyOffset::Yes);
                 last.insert(last.end(), growth.begin(), growth.end());
                 last = union_ex(last);
@@ -849,12 +852,13 @@ ProcessSurfaceResult PerimeterGenerator::process_classic(int& loop_number, const
         }
         bool has_steep_overhang = false;
         if (this->layer->id() % 2 == 1 && this->config->overhangs_reverse //check if my option is set and good layer
-            && !last.empty() && !overhangs_unsupported.empty() //has something to work with
+            && !last.empty() //has something to work with
             ) {
+            ExPolygons overhangs = diff_ex(last, *lower_slices);
             coord_t offset = scale_t(config->overhangs_reverse_threshold.get_abs_value(this->perimeter_flow.width()));
             //version with: scale_(std::tan(PI * (0.5f / 90) * config->overhangs_reverse_threshold.value ) * this->layer->height)
 
-            if (offset_ex(overhangs_unsupported, -offset / 2.).size() > 0) {
+            if (offset_ex(overhangs, -offset / 2.).size() > 0) {
                 //allow this loop to be printed in reverse
                 has_steep_overhang = true;
             }
@@ -2330,7 +2334,7 @@ ExtrusionEntityCollection PerimeterGenerator::_traverse_loops(
             // Note that we set loop role to ContourInternalPerimeter
             // also when loop is both internal and external (i.e.
             // there's only one contour loop).
-            loop_role = ExtrusionLoopRole::elrInternal;
+            loop_role = (ExtrusionLoopRole)(loop_role | ExtrusionLoopRole::elrInternal);
         }
         if (!loop.is_contour) {
             loop_role = (ExtrusionLoopRole)(loop_role | ExtrusionLoopRole::elrHole);
@@ -2437,7 +2441,10 @@ ExtrusionEntityCollection PerimeterGenerator::_traverse_loops(
                 coll_out.append(std::move(children.entities()));
                 coll_out.append(*eloop);
             } else {
-                eloop->make_clockwise();
+                if (loop.is_steep_overhang && this->layer->id() % 2 == 1)
+                    eloop->make_counter_clockwise();
+                else
+                    eloop->make_clockwise();
                 coll_out.append(*eloop);
                 coll_out.append(std::move(children.entities()));
             }
@@ -2459,10 +2466,21 @@ ExtrusionEntityCollection PerimeterGenerator::_traverse_extrusions(std::vector<P
             continue;
 
         const bool    is_external = extrusion->inset_idx == 0;
-        ExtrusionRole role = is_external ? erExternalPerimeter : erPerimeter;
         ExtrusionLoopRole loop_role = ExtrusionLoopRole::elrDefault;
+        ExtrusionRole role = is_external ? erExternalPerimeter : erPerimeter;
         if (biggest_inset_idx == extrusion->inset_idx) {
-            loop_role = ExtrusionLoopRole(ExtrusionLoopRole::elrInternal | ExtrusionLoopRole::elrFirstLoop);
+            // Note that we set loop role to ContourInternalPerimeter
+            // also when loop is both internal and external (i.e.
+            // there's only one contour loop).
+            loop_role = (ExtrusionLoopRole)(loop_role | ExtrusionLoopRole::elrInternal | ExtrusionLoopRole::elrFirstLoop);
+        }
+        if (!pg_extrusion.is_contour) {
+            loop_role = (ExtrusionLoopRole)(loop_role | ExtrusionLoopRole::elrHole);
+        }
+        if (this->config->external_perimeters_vase.value && this->config->external_perimeters_first.value && is_external) {
+            if ((pg_extrusion.is_contour && this->config->external_perimeters_nothole.value) || (!pg_extrusion.is_contour && this->config->external_perimeters_hole.value)) {
+                loop_role = (ExtrusionLoopRole)(loop_role | ExtrusionLoopRole::elrVase);
+            }
         }
 
         // fuzzy_extrusion_line() don't work. I can use fuzzy_paths() anyway, not a big deal.

@@ -232,7 +232,7 @@ std::string Wipe::wipe(GCode& gcodegen, bool toolchange)
                     gcode += gcodegen.writer().set_speed(wipe_speed, "", gcodegen.enable_cooling_markers() ? ";_WIPE" : "");
                 gcode += gcodegen.writer().extrude_to_xy(
                     gcodegen.point_to_gcode(line.b),
-                    -dE,
+                    gcodegen.config().use_firmware_retraction? 0 : -dE,
                     "wipe and retract"
                 );
             }
@@ -575,6 +575,19 @@ std::vector<GCode::LayerToPrint> GCode::collect_layers_to_print(const PrintObjec
 
     std::vector<std::pair<double, double>> warning_ranges;
 
+    //check for max nozzle diameter
+    const std::vector<double>& nozzle_diameters = object.print()->config().nozzle_diameter.values;
+    std::set<uint16_t> exctruder_ids = object.object_extruders();
+    double max_nozzle = 0;
+    for (uint16_t id : exctruder_ids) {
+        max_nozzle = std::max(max_nozzle, nozzle_diameters[id]);
+    }
+    if (max_nozzle == 0)
+        max_nozzle = nozzle_diameters.front();
+    double top_cd = object.config().support_material_contact_distance.get_abs_value(max_nozzle);
+    double bottom_cd = object.config().support_material_bottom_contact_distance.value == 0. ? top_cd : object.config().support_material_bottom_contact_distance.get_abs_value(max_nozzle);
+    double raft_cd = object.config().raft_contact_distance.value;
+
     // Pair the object layers with the support layers by z.
     size_t idx_object_layer  = 0;
     size_t idx_support_layer = 0;
@@ -611,28 +624,34 @@ std::vector<GCode::LayerToPrint> GCode::collect_layers_to_print(const PrintObjec
         if ((layer_to_print.object_layer && layer_to_print.object_layer->has_extrusions())
             // Allow empty support layers, as the support generator may produce no extrusions for non-empty support regions.
          || (layer_to_print.support_layer /* && layer_to_print.support_layer->has_extrusions() */)) {
-            //check for max nozzle diameter
-            const std::vector<double>& nozzle_diameters = object.print()->config().nozzle_diameter.values;
-            std::set<uint16_t> exctruder_ids = object.object_extruders();
-            double max_nozzle = 0;
-            for (uint16_t id : exctruder_ids) {
-                max_nozzle = std::max(max_nozzle, nozzle_diameters[id]);
-            }
-            if (max_nozzle == 0)
-                max_nozzle = nozzle_diameters.front();
-
-            double top_cd = object.config().support_material_contact_distance.get_abs_value(max_nozzle);
-            double bottom_cd = object.config().support_material_bottom_contact_distance.value == 0. ? top_cd : object.config().support_material_bottom_contact_distance.get_abs_value(max_nozzle);
 
             double extra_gap = (layer_to_print.support_layer ? bottom_cd : top_cd);
+            if (object.config().raft_layers.value > 0 && layer_to_print.layer()->id() <= object.config().raft_layers.value) {
+                extra_gap = raft_cd;
+            }
+            if (object.config().support_material_contact_distance_type.value == SupportZDistanceType::zdNone) {
+                extra_gap = 0;
+            } else if (object.config().support_material_contact_distance_type.value == SupportZDistanceType::zdFilament) {
+                //compute the height of bridge.
+                if (layer_to_print.layer()->id() > 0 && !layer_to_print.layer()->regions().empty()) {
+                    extra_gap += layer_to_print.layer()->regions().front()->bridging_flow(FlowRole::frSolidInfill).height();
+                } else {
+                    extra_gap += layer_to_print.layer()->height;
+                }
+            } else { //SupportZDistanceType::zdPlane
+                extra_gap += layer_to_print.layer()->height;
+            }
 
-            double maximal_print_z = (last_extrusion_layer ? last_extrusion_layer->print_z() : 0.)
-                + layer_to_print.layer()->height
-                + std::max(0., extra_gap);
+            double maximal_print_z = check_z_step(
+                (last_extrusion_layer ? last_extrusion_layer->print_z() : 0.) + std::max(0., extra_gap),
+                object.print()->config().z_step);
             // Negative support_contact_z is not taken into account, it can result in false positives in cases
             // where previous layer has object extrusions too (https://github.com/prusa3d/PrusaSlicer/issues/2752)
 
-            if (has_extrusions && !object.print()->config().allow_empty_layers && layer_to_print.print_z() > maximal_print_z + 2. * EPSILON)
+            if (has_extrusions && !object.print()->config().allow_empty_layers && layer_to_print.print_z() > maximal_print_z + 2. * EPSILON
+                //don't check for raft layers: there is an empty space between the last raft and the first layer
+                //&& (object.config().raft_layers.value == 0 || (layer_to_print.object_layer && layer_to_print.object_layer->id() > object.config().raft_layers.value)) 
+                )
                 warning_ranges.emplace_back(std::make_pair((last_extrusion_layer ? last_extrusion_layer->print_z() : 0.), layers_to_print.back().print_z()));
         }
         // Remember last layer with extrusions.
@@ -1603,8 +1622,6 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
             print.skirt_first_layer()->visit(bbvisitor);
         } else if (print.skirt().entities().size() > 0) {
             print.skirt().visit(bbvisitor);
-        } else if (print.config().complete_objects_one_brim.value && !print.brim().empty()) {
-            print.brim().visit(bbvisitor);
         } else {
             print.brim().visit(bbvisitor);
             for (const PrintObject* po : print.objects()) {
@@ -2054,14 +2071,14 @@ void GCode::process_layers(
 
     // The pipeline elements are joined using const references, thus no copying is performed.
     output_stream.find_replace_supress();
-    if (m_spiral_vase && m_find_replace)
-        tbb::parallel_pipeline(12, generator & spiral_vase & cooling & fan_mover & find_replace & output);
-    else if (m_spiral_vase)
-        tbb::parallel_pipeline(12, generator &  spiral_vase & cooling & fan_mover & output);
-    else if (m_find_replace)
-        tbb::parallel_pipeline(12, generator & cooling & fan_mover & find_replace & output);
-    else
-        tbb::parallel_pipeline(12, generator & cooling & fan_mover & output);
+    tbb::filter<void, GCode::LayerResult> pipeline_to_layerresult = generator;
+    if (m_spiral_vase)
+        pipeline_to_layerresult = pipeline_to_layerresult & spiral_vase;
+    tbb::filter<void, std::string> pipeline_to_string = pipeline_to_layerresult & cooling & fan_mover;
+    if (m_find_replace)
+        pipeline_to_string = pipeline_to_string & find_replace;
+    tbb::filter<void, void> full_pipeline = pipeline_to_string & output;
+    tbb::parallel_pipeline(12, full_pipeline);
     output_stream.find_replace_enable();
 }
 
@@ -2091,9 +2108,9 @@ void GCode::process_layers(
         });
     const auto spiral_vase = tbb::make_filter<GCode::LayerResult, GCode::LayerResult>(slic3r_tbb_filtermode::serial_in_order,
         [&spiral_vase = *this->m_spiral_vase.get()](GCode::LayerResult in)->GCode::LayerResult {
-            spiral_vase.enable(in.spiral_vase_enable);
-            return { spiral_vase.process_layer(std::move(in.gcode)), in.layer_id, in.spiral_vase_enable, in.cooling_buffer_flush };
-        });
+        spiral_vase.enable(in.spiral_vase_enable);
+        return { spiral_vase.process_layer(std::move(in.gcode)), in.layer_id, in.spiral_vase_enable, in.cooling_buffer_flush };
+    });
     const auto cooling = tbb::make_filter<GCode::LayerResult, std::string>(slic3r_tbb_filtermode::serial_in_order,
         [&cooling_buffer = *this->m_cooling_buffer.get()](GCode::LayerResult in)->std::string {
             return cooling_buffer.process_layer(std::move(in.gcode), in.layer_id, in.cooling_buffer_flush);
@@ -2128,14 +2145,14 @@ void GCode::process_layers(
 
     // The pipeline elements are joined using const references, thus no copying is performed.
     output_stream.find_replace_supress();
-    if (m_spiral_vase && m_find_replace)
-        tbb::parallel_pipeline(12, generator & spiral_vase & cooling & fan_mover & find_replace & output);
-    else if (m_spiral_vase)
-        tbb::parallel_pipeline(12, generator & spiral_vase & cooling & fan_mover & output);
-    else if (m_find_replace)
-        tbb::parallel_pipeline(12, generator & cooling & fan_mover & find_replace & output);
-    else
-        tbb::parallel_pipeline(12, generator & cooling & fan_mover & output);
+    tbb::filter<void, GCode::LayerResult> pipeline_to_layerresult = generator;
+    if (m_spiral_vase)
+        pipeline_to_layerresult = pipeline_to_layerresult & spiral_vase;
+    tbb::filter<void, std::string> pipeline_to_string = pipeline_to_layerresult & cooling & fan_mover;
+    if (m_find_replace)
+        pipeline_to_string = pipeline_to_string & find_replace;
+    tbb::filter<void, void> full_pipeline = pipeline_to_string & output;
+    tbb::parallel_pipeline(12, full_pipeline);
     output_stream.find_replace_enable();
 }
 
@@ -2736,7 +2753,7 @@ GCode::LayerResult GCode::process_layer(
             print.config().before_layer_gcode.value, m_writer.tool()->id(), &config)
             + "\n";
     }
-    // print z move to next layer UNLESS
+    // print z move to next layer UNLESS (HACK for superslicer#1775)
     // if it's going to the first layer, then we may want to delay the move in these condition:
     // there is no "after layer change gcode" and it's the first move from the unknown
     if (print.config().layer_gcode.value.empty() && !m_last_pos_defined && m_config.start_gcode_manual && (
@@ -2745,6 +2762,9 @@ GCode::LayerResult GCode::process_layer(
         ||   // or lift_min is higher than the first layer height.
          m_config.lift_min.value > layer.print_z
             )) {
+        // still do the retraction
+        gcode += m_writer.retract();
+        gcode += m_writer.reset_e();
         m_delayed_layer_change = this->change_layer(print_z); //HACK for superslicer#1775
     } else {
         //extra lift on layer change if multiple objects
@@ -3030,7 +3050,7 @@ GCode::LayerResult GCode::process_layer(
             //to go to the object-only skirt or brim, or to the object  (May be overriden here but I don't care)
             set_extra_lift(m_last_layer_z, layer.id(), print.config(), m_writer, extruder_id);
         }
-        //extrude object-only skirt
+        //extrude object-only skirt (for sequential)
         //TODO: use it also for wiping like the other one (as they are exlusiev)
         if (single_object_instance_idx != size_t(-1) && !layers.front().object()->skirt().empty()
             && extruder_id == layer_tools.extruders.front()) {
@@ -3046,19 +3066,20 @@ GCode::LayerResult GCode::process_layer(
                         gcode += this->extrude_entity(*ee, "");
             }
         }
-        //extrude object-only brim
+        //extrude object-only brim (for sequential)
         if (single_object_instance_idx != size_t(-1) && !layers.front().object()->brim().empty()
             && extruder_id == layer_tools.extruders.front()) {
 
-            const PrintObject *print_object = layers.front().object();
+            const PrintObject* print_object = layers.front().object();
             this->set_origin(unscale(print_object->instances()[single_object_instance_idx].shift));
             if (this->m_layer != nullptr && this->m_layer->id() == 0) {
                 m_avoid_crossing_perimeters.use_external_mp(true);
-                for (const ExtrusionEntity *ee : print_object->brim().entities())
+                for (const ExtrusionEntity* ee : print_object->brim().entities())
                     gcode += this->extrude_entity(*ee, "brim");
                 m_avoid_crossing_perimeters.use_external_mp(false);
                 m_avoid_crossing_perimeters.disable_once();
             }
+            
         }
 
 
@@ -3129,6 +3150,22 @@ GCode::LayerResult GCode::process_layer(
                     m_layer = layer_to_print.layer();
                     m_object_layer_over_raft = object_layer_over_raft;
                 }
+                //extrude instance-only brim
+                if (this->m_layer != nullptr && this->m_layer->id() == 0 && single_object_instance_idx == size_t(-1) && !instance_to_print.print_object.brim().empty()) {
+                    assert(instance_to_print.instance_id < instance_to_print.print_object.brim().items_count());
+                    this->set_origin(0., 0.);
+                    if (this->m_layer != nullptr && this->m_layer->id() == 0) {
+                        m_avoid_crossing_perimeters.use_external_mp(true);
+                        assert(instance_to_print.print_object.brim().entities()[instance_to_print.instance_id]->is_collection());
+                        if (const ExtrusionEntityCollection* coll = dynamic_cast<const ExtrusionEntityCollection*>(instance_to_print.print_object.brim().entities()[instance_to_print.instance_id])) {
+                            for (const ExtrusionEntity* ee : coll->entities())
+                                gcode += this->extrude_entity(*ee, "brim");
+                        }
+                        m_avoid_crossing_perimeters.use_external_mp(false);
+                        m_avoid_crossing_perimeters.disable_once();
+                    }
+                    this->set_origin(unscale(offset));
+                }
                 //FIXME order islands?
                 // Sequential tool path ordering of multiple parts within the same object, aka. perimeter tracking (#5511)
                 for (ObjectByExtruder::Island &island : instance_to_print.object_by_extruder.islands) {
@@ -3159,14 +3196,6 @@ GCode::LayerResult GCode::process_layer(
         }
     }
 
-#if 0
-    // Apply spiral vase post-processing if this layer contains suitable geometry
-    // (we must feed all the G-code into the post-processor, including the first
-    // bottom non-spiral layers otherwise it will mess with positions)
-    // we apply spiral vase at this stage because it requires a full layer.
-    // Just a reminder: A spiral vase mode is allowed for a single object per layer, single material print only.
-    if (m_spiral_vase)
-        gcode = m_spiral_vase->process_layer(std::move(gcode));
 
 
     //add milling post-process if enabled
@@ -3207,10 +3236,10 @@ GCode::LayerResult GCode::process_layer(
                 check_add_eol(gcode);
             }
 
-            gcode += "\n; began print:";
+            gcode += "\n; began milling:\n";
             for (const LayerToPrint& ltp : layers) {
                 if (ltp.object_layer != nullptr) {
-                    for (const PrintInstance& print_instance : ltp.object()->instances()){
+                    for (const PrintInstance& print_instance : ltp.object()->instances()) {
                         this->set_origin(unscale(print_instance.shift));
                         for (const LayerRegion* lr : ltp.object_layer->regions()) {
                             if (!lr->milling.empty()) {
@@ -3224,7 +3253,7 @@ GCode::LayerResult GCode::process_layer(
             }
 
             //switch to extruder
-            m_placeholder_parser.set("current_extruder", milling_extruder_id);
+            m_placeholder_parser.set("current_extruder", current_extruder_filament);
             // Append the filament start G-code.
             const std::string& end_mill_gcode = m_config.milling_toolchange_end_gcode.get_at(0);
             if (!end_mill_gcode.empty()) {
@@ -3247,6 +3276,14 @@ GCode::LayerResult GCode::process_layer(
         }
     }
 
+#if 0
+    // Apply spiral vase post-processing if this layer contains suitable geometry
+    // (we must feed all the G-code into the post-processor, including the first
+    // bottom non-spiral layers otherwise it will mess with positions)
+    // we apply spiral vase at this stage because it requires a full layer.
+    // Just a reminder: A spiral vase mode is allowed for a single object per layer, single material print only.
+    if (m_spiral_vase)
+        gcode = m_spiral_vase->process_layer(std::move(gcode));
 
     // Apply cooling logic; this may alter speeds.
     if (m_cooling_buffer)
