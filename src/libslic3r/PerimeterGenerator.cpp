@@ -29,6 +29,13 @@
 #include <list>
 #include <boost/log/trivial.hpp>
 
+//#define ARACHNE_DEBUG
+
+#ifdef ARACHNE_DEBUG
+#include "SVG.hpp"
+#include "Utils.hpp"
+#endif
+
 namespace Slic3r {
 
 PerimeterGeneratorLoops get_all_Childs(PerimeterGeneratorLoop loop) {
@@ -119,7 +126,7 @@ static void fuzzy_extrusion_line(Arachne::ExtrusionLine &ext_lines, double fuzzy
     }
 
     if (ext_lines.back().p == ext_lines.front().p) // Connect endpoints.
-        out.back().p = out.front().p;
+        out.front().p = out.back().p;
 
     if (out.size() >= 3)
         ext_lines.junctions = std::move(out);
@@ -136,6 +143,27 @@ void convert_to_clipperpath(const Polygons& source, ClipperLib_Z::Paths& dest) {
             out.emplace_back(pt.x(), pt.y(), 0);
     }
 }
+
+#ifdef ARACHNE_DEBUG
+static void export_perimeters_to_svg(const std::string &path, const Polygons &contours, const std::vector<Arachne::VariableWidthLines> &perimeters, const ExPolygons &infill_area)
+{
+    coordf_t    stroke_width = scale_(0.03);
+    BoundingBox bbox         = get_extents(contours);
+    bbox.offset(scale_(1.));
+    ::Slic3r::SVG svg(path.c_str(), bbox);
+
+    svg.draw(infill_area, "cyan");
+
+    for (const Arachne::VariableWidthLines &perimeter : perimeters)
+        for (const Arachne::ExtrusionLine &extrusion_line : perimeter) {
+            ThickPolyline thick_polyline = to_thick_polyline(extrusion_line);
+            svg.draw({thick_polyline}, "green", "blue", stroke_width);
+        }
+
+    for (const Line &line : to_lines(contours))
+        svg.draw(line, "red", stroke_width);
+}
+#endif
 
 // Thanks, Cura developers, for implementing an algorithm for generating perimeters with variable width (Arachne) that is based on the paper
 // "A framework for adaptive width control of dense contour-parallel toolpaths in fused deposition modeling"
@@ -166,6 +194,13 @@ ProcessSurfaceResult PerimeterGenerator::process_arachne(int& loop_number, const
     Arachne::WallToolPaths wallToolPaths(last_p, this->get_ext_perimeter_spacing(), this->get_ext_perimeter_width(), this->get_perimeter_spacing(), this->get_perimeter_width(), coord_t(loop_number + 1), 0, this->layer->height, *this->object_config, *this->print_config);
     std::vector<Arachne::VariableWidthLines> perimeters = wallToolPaths.getToolPaths();
     loop_number = int(perimeters.size()) - 1;
+
+#ifdef ARACHNE_DEBUG
+        {
+            static int iRun = 0;
+            export_perimeters_to_svg(debug_out_path("arachne-perimeters-%d-%d.svg", layer_id, iRun++), to_polygons(last), perimeters, union_ex(wallToolPaths.getInnerContour()));
+        }
+#endif
 
     // All closed ExtrusionLine should have the same the first and the last point.
     // But in rare cases, Arachne produce ExtrusionLine marked as closed but without
@@ -1907,7 +1942,7 @@ ExtrusionPaths PerimeterGenerator::create_overhangs(const Polyline& loop_polygon
     return paths;
 }
 
-
+//TODO: transform to ExtrusionMultiPath instead of ExtrusionPaths
 ExtrusionPaths PerimeterGenerator::create_overhangs(const ClipperLib_Z::Path& arachne_path, ExtrusionRole role, bool is_external) const {
     ExtrusionPaths paths;
     const bool is_loop = Point{ arachne_path.front().x(), arachne_path.front().y() }.coincides_with_epsilon(Point{ arachne_path.back().x(), arachne_path.back().y() });
@@ -1918,7 +1953,7 @@ ExtrusionPaths PerimeterGenerator::create_overhangs(const ClipperLib_Z::Path& ar
         //assert(path.mm3_per_mm == path.mm3_per_mm);
         //assert(path.width == path.width);
         //assert(path.height == path.height);
-        append(paths, Geometry::variable_width(Arachne::to_thick_polyline(arachne_path),
+        append(paths, Geometry::unsafe_variable_width(Arachne::to_thick_polyline(arachne_path),
             role,
             is_external ? this->ext_perimeter_flow : this->perimeter_flow,
             std::max(this->ext_perimeter_flow.scaled_width() / 4, scale_t(this->print_config->resolution)),
@@ -2020,14 +2055,14 @@ ExtrusionPaths PerimeterGenerator::create_overhangs(const ClipperLib_Z::Path& ar
     if (!ok_polylines.empty()) {
         //fast track
         if (small_speed.empty() && big_speed.empty() && small_flow.empty() && big_flow.empty()) {
-            return Geometry::variable_width(Arachne::to_thick_polyline(arachne_path),
+            return Geometry::unsafe_variable_width(Arachne::to_thick_polyline(arachne_path),
                 role,
                 is_external ? this->ext_perimeter_flow : this->perimeter_flow,
                 std::max(this->ext_perimeter_flow.scaled_width() / 4, scale_t(this->print_config->resolution)),
                 (is_external ? this->ext_perimeter_flow : this->perimeter_flow).scaled_width() / 10);
         }
         for (const ClipperLib_Z::Path& extrusion_path : ok_polylines) {
-            for (auto&& path : Geometry::variable_width(Arachne::to_thick_polyline(extrusion_path),
+            for (auto&& path : Geometry::unsafe_variable_width(Arachne::to_thick_polyline(extrusion_path),
                 role,
                 is_external ? this->ext_perimeter_flow : this->perimeter_flow,
                 std::max(this->ext_perimeter_flow.scaled_width() / 4, scale_t(this->print_config->resolution)),
@@ -2039,7 +2074,7 @@ ExtrusionPaths PerimeterGenerator::create_overhangs(const ClipperLib_Z::Path& ar
     }
     if (!small_speed.empty()) {
         for (const ClipperLib_Z::Path& extrusion_path : small_speed) {
-            for (auto&& path : Geometry::variable_width(Arachne::to_thick_polyline(extrusion_path),
+            for (auto&& path : Geometry::unsafe_variable_width(Arachne::to_thick_polyline(extrusion_path),
                 erOverhangPerimeter,
                 is_external ? this->ext_perimeter_flow : this->perimeter_flow,
                 std::max(this->ext_perimeter_flow.scaled_width() / 4, scale_t(this->print_config->resolution)),
@@ -2051,7 +2086,7 @@ ExtrusionPaths PerimeterGenerator::create_overhangs(const ClipperLib_Z::Path& ar
     }
     if (!big_speed.empty()) {
         for (const ClipperLib_Z::Path& extrusion_path : big_speed) {
-            for (auto&& path : Geometry::variable_width(Arachne::to_thick_polyline(extrusion_path),
+            for (auto&& path : Geometry::unsafe_variable_width(Arachne::to_thick_polyline(extrusion_path),
                 erOverhangPerimeter,
                 is_external ? this->ext_perimeter_flow : this->perimeter_flow,
                 std::max(this->ext_perimeter_flow.scaled_width() / 4, scale_t(this->print_config->resolution)),
@@ -2063,7 +2098,7 @@ ExtrusionPaths PerimeterGenerator::create_overhangs(const ClipperLib_Z::Path& ar
     }
     if (!small_flow.empty()) {
         for (const ClipperLib_Z::Path& extrusion_path : small_flow) {
-            for (auto&& path : Geometry::variable_width(Arachne::to_thick_polyline(extrusion_path),
+            for (auto&& path : Geometry::unsafe_variable_width(Arachne::to_thick_polyline(extrusion_path),
                 erOverhangPerimeter,
                 this->overhang_flow,
                 std::max(this->ext_perimeter_flow.scaled_width() / 4, scale_t(this->print_config->resolution)),
@@ -2075,7 +2110,7 @@ ExtrusionPaths PerimeterGenerator::create_overhangs(const ClipperLib_Z::Path& ar
     }
     if (!big_flow.empty()) {
         for (const ClipperLib_Z::Path& extrusion_path : big_flow) {
-            for (auto&& path : Geometry::variable_width(Arachne::to_thick_polyline(extrusion_path),
+            for (auto&& path : Geometry::unsafe_variable_width(Arachne::to_thick_polyline(extrusion_path),
                 erOverhangPerimeter,
                 this->overhang_flow,
                 std::max(this->ext_perimeter_flow.scaled_width() / 4, scale_t(this->print_config->resolution)),
@@ -2540,7 +2575,7 @@ ExtrusionEntityCollection PerimeterGenerator::_traverse_extrusions(std::vector<P
                 chain_and_reorder_extrusion_paths(paths, &start_point);
             }
         } else {
-            append(paths, Geometry::variable_width(Arachne::to_thick_polyline(*extrusion),
+            append(paths, Geometry::unsafe_variable_width(Arachne::to_thick_polyline(*extrusion),
                 role,
                 is_external ? this->ext_perimeter_flow : this->perimeter_flow,
                 std::max(this->ext_perimeter_flow.scaled_width() / 4, scale_t(this->print_config->resolution)),
@@ -2565,11 +2600,37 @@ ExtrusionEntityCollection PerimeterGenerator::_traverse_extrusions(std::vector<P
                     extrusion_loop.make_counter_clockwise();
                 else
                     extrusion_loop.make_clockwise();
-
+#if _DEBUG
+                for (auto it = std::next(extrusion_loop.paths.begin()); it != extrusion_loop.paths.end(); ++it) {
+                    assert(it->polyline.points.size() >= 2);
+                    assert(std::prev(it)->polyline.last_point() == it->polyline.first_point());
+                }
+                assert(extrusion_loop.paths.front().first_point() == extrusion_loop.paths.back().last_point());
+#endif
                 extrusion_coll.append(std::move(extrusion_loop));
-            } else
-                for (ExtrusionPath& path : paths)
-                    extrusion_coll.append(ExtrusionPath(std::move(path)));
+            } else {
+
+                // Because we are processing one ExtrusionLine all ExtrusionPaths should form one connected path.
+                // But there is possibility that due to numerical issue there is poss
+                assert([&paths = std::as_const(paths)]() -> bool {
+                    for (auto it = std::next(paths.begin()); it != paths.end(); ++it)
+                        if (std::prev(it)->polyline.last_point() != it->polyline.first_point())
+                            return false;
+                    return true;
+                }());
+                ExtrusionMultiPath multi_path;
+                multi_path.paths.emplace_back(std::move(paths.front()));
+
+                for (auto it_path = std::next(paths.begin()); it_path != paths.end(); ++it_path) {
+                    if (multi_path.paths.back().last_point() != it_path->first_point()) {
+                        extrusion_coll.append(std::move(multi_path));
+                        multi_path = ExtrusionMultiPath();
+                    }
+                    multi_path.paths.push_back(std::move(*it_path));
+                }
+
+                extrusion_coll.append(ExtrusionMultiPath(std::move(multi_path)));
+            }
         }
     }
 
